@@ -2,20 +2,43 @@ from langchain_ollama import ChatOllama
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from src.config import settings
-from src.utils.errors import ToolExecutionError
+from src.tools.file_ops import read_file
 
-def summarize_text(text: str) -> dict:
-    """Summarizes provided text using the local LLM."""
+
+_llm = ChatOllama(
+    model=settings.GENERATION_LLM,
+    base_url=settings.OLLAMA_BASE_URL,
+    temperature=0.0,
+    num_ctx=8192,
+    num_predict=512,
+)
+
+def summarize_text(text: str) -> str:
+    """Summarize the provided text concisely and clearly."""
     try:
-        llm = ChatOllama(model=settings.DEFAULT_LLM, base_url=settings.OLLAMA_BASE_URL)
-        
-        messages = [
-            SystemMessage(content="Summarize the following text concisely. Provide only the summary."),
-            HumanMessage(content=text)
-        ]
-        
-        response = llm.invoke(messages)
-        return {"status": "success", "summary": response.content.strip()}
-        
+        if not text or not text.strip():
+            return "Error: Empty text provided."
+        resp = _llm.invoke(
+            [
+                SystemMessage(
+                    content=(
+                        "You are a precise summarizer. "
+                        "Return only the final summary text."
+                    )
+                ),
+                HumanMessage(content=text),
+            ]
+        )
+        return (resp.content or "").strip()
     except Exception as e:
-        raise ToolExecutionError("summarize_text", str(e))
+        return f"Error executing summarize_text: {e}"
+    
+def read_and_summarize_file(filename: str) -> str:
+    """Read a sandboxed file and return its summary."""
+    try:
+        content = read_file(filename=filename)
+        if isinstance(content, str) and content.startswith("Error:"):
+            return content
+        return summarize_text(content)
+    except Exception as e:
+        return f"Error reading/summarizing file: {e}"

@@ -1,131 +1,211 @@
 import uuid
+from pathlib import Path
 import streamlit as st
 from langchain_core.messages import HumanMessage, AIMessage
 
 from src.audio.local_stt import HuggingFaceSTT
 from src.audio.recorder import save_audio_to_temp
-from src.agent.graph import agent_graph
+from src.agent.pipeline import parse_user_input, execute_plan
 from src.config import settings
 
-# --- Configuration & Caching ---
-st.set_page_config(page_title="Local Voice Agent", page_icon="🎙️", layout="wide")
+st.set_page_config(page_title="VoiceAgent", page_icon="🎙️", layout="wide")
+
 
 @st.cache_resource
-def load_stt_engine():
-    """Loads the STT model once to prevent reloading on every UI interaction."""
+def load_stt_engine() -> HuggingFaceSTT:
     return HuggingFaceSTT()
+
+
+def _dir_tree_lines(root: Path, prefix: str = "") -> list[str]:
+    if not root.exists():
+        return ["(missing)"]
+    lines: list[str] = []
+    items = sorted(root.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+    for i, p in enumerate(items):
+        is_last = i == len(items) - 1
+        branch = "└── " if is_last else "├── "
+        lines.append(f"{prefix}{branch}{p.name}/" if p.is_dir() else f"{prefix}{branch}{p.name}")
+        if p.is_dir():
+            ext = "    " if is_last else "│   "
+            lines.extend(_dir_tree_lines(p, prefix + ext))
+    return lines
+
+
+NO_HITL_INTENTS = {
+    "general_chat",
+    "summarize_text",
+    "read_and_summarize_file",
+    "read_and_summarise_file",  # alias safety
+    "read_file",
+}
+
+def _requires_hitl(plan: list[dict]) -> bool:
+    if not plan:
+        return False
+    intents = [str(a.get("intent", "")).strip() for a in plan]
+    return not all(i in NO_HITL_INTENTS for i in intents)
+
+
+
+def _assistant_text(results: list[dict]) -> str:
+    parts = [str(r.get("output", "")).strip() for r in results if str(r.get("output", "")).strip()]
+    return "\n\n".join(parts) if parts else "Done."
+
+def _render_assistant(turn: dict) -> None:
+    with st.chat_message("assistant"):
+        st.markdown(turn["assistant"])
+        with st.expander("Details", expanded=settings.UI_DETAILS_EXPANDED_DEFAULT):
+            st.json(
+                {
+                    "transcribed_text": turn.get("transcribed_text", ""),
+                    "detected_intent": [a.get("intent") for a in turn.get("plan", [])],
+                    "plan": turn.get("plan", []),
+                    "results": turn.get("results", []),
+                }
+            )
+
+def _history_messages(turns: list[dict]):
+    msgs = []
+    for t in turns:
+        msgs.append(HumanMessage(content=t["user"]))
+        msgs.append(AIMessage(content=t["assistant"]))
+    return msgs
+
+
+# Session
+if "threads" not in st.session_state:
+    first = str(uuid.uuid4())
+    st.session_state.threads = {first: []}  # thread_id -> list[turns]
+    st.session_state.thread_id = first
+
+if "pending_plan" not in st.session_state:
+    st.session_state.pending_plan = None
+if "pending_user_text" not in st.session_state:
+    st.session_state.pending_user_text = ""
+if "last_transcription" not in st.session_state:
+    st.session_state.last_transcription = ""
 
 stt_engine = load_stt_engine()
 
-# --- Session Management ---
-if "thread_id" not in st.session_state:
-    st.session_state.thread_id = str(uuid.uuid4())
-
-# Configuration passed to LangGraph to identify the session memory
-config = {"configurable": {"thread_id": st.session_state.thread_id}}
-
-# --- Sidebar UI ---
+# Sidebar
 with st.sidebar:
-    st.header("⚙️ Configuration")
-    
-    new_thread = st.text_input("Session ID", value=st.session_state.thread_id)
-    if new_thread != st.session_state.thread_id:
-        st.session_state.thread_id = new_thread
+    st.header("Threads")
+    ids = list(st.session_state.threads.keys())
+    selected = st.selectbox("Select thread", ids, index=ids.index(st.session_state.thread_id))
+    if selected != st.session_state.thread_id:
+        st.session_state.thread_id = selected
+        st.session_state.pending_plan = None
+        st.session_state.pending_user_text = ""
         st.rerun()
-        
-    if st.button("Start New Session"):
-        st.session_state.thread_id = str(uuid.uuid4())
+
+    if st.button("➕ New Chat", use_container_width=True):
+        nid = str(uuid.uuid4())
+        st.session_state.threads[nid] = []
+        st.session_state.thread_id = nid
+        st.session_state.pending_plan = None
+        st.session_state.pending_user_text = ""
         st.rerun()
 
     st.divider()
-    
-    st.header("📁 Sandbox (output/)")
-    if settings.OUTPUT_DIR.exists():
-        for f in settings.OUTPUT_DIR.iterdir():
-            icon = "📁" if f.is_dir() else "📄"
-            st.text(f"{icon} {f.name}")
-    else:
-        st.caption("Sandbox empty.")
+    if settings.UI_SHOW_SANDBOX_TREE:
+        st.header("Sandbox: output/")
+        st.code("\n".join(_dir_tree_lines(settings.OUTPUT_DIR)), language="text")
 
-# --- Helpers ---
-def render_chat_history():
-    """Renders the conversational history from LangGraph's memory."""
-    state = agent_graph.get_state(config)
-    messages = state.values.get("messages", [])
-    
-    for msg in messages:
-        if isinstance(msg, HumanMessage):
-             with st.chat_message("user"):
-                 st.write(msg.content)
-        elif isinstance(msg, AIMessage):
-             with st.chat_message("assistant"):
-                 st.write(msg.content)
+# Main
+st.title("🎙️ VoiceAgent")
+turns = st.session_state.threads[st.session_state.thread_id]
 
-def process_audio(audio_file):
-    """Handles STT and sends the text to the LangGraph agent."""
-    with st.spinner("Transcribing..."):
-        temp_path = save_audio_to_temp(audio_file)
-        transcription = stt_engine.transcribe(temp_path)
-        temp_path.unlink(missing_ok=True) # Cleanup
-        
-    if transcription:
-        st.session_state.last_transcription = transcription
-        input_state = {"transcription": transcription}
-        
-        with st.spinner("Thinking..."):
-            for event in agent_graph.stream(input_state, config):
-                pass # Graph runs until the exact _interrupt_ before the 'act' node
-        st.rerun()
+# Unified chat rendering
+for t in turns:
+    with st.chat_message("user"):
+        st.write(t["user"])
+    _render_assistant(t)
 
-# --- Main UI Layout ---
-st.title("🎙️ Local Voice Agent")
-st.caption(f"Session ID: {st.session_state.thread_id}")
+# HITL only for non-general intents
+if st.session_state.pending_plan is not None:
+    st.info("Pending action. Approve once to run full tool plan.")
+    with st.expander("Details", expanded=True):
+        st.json(
+            {
+                "transcribed_text": st.session_state.last_transcription,
+                "detected_intent": [a.get("intent") for a in st.session_state.pending_plan],
+                "plan": st.session_state.pending_plan,
+            }
+        )
 
-# 1. Display Chat History
-render_chat_history()
-
-# 2. Check current graph state for HITL (Human-in-the-loop)
-current_state = agent_graph.get_state(config)
-
-# If the graph's next step is 'act', it means we hit our interrupt.
-if current_state.next and "act" in current_state.next:
-    st.warning("Action Approval Required")
-    pending_intents = current_state.values.get("parsed_intents", [])
-    
-    with st.expander("Show Pending Actions", expanded=True):
-        st.json(pending_intents)
-        
-    col1, col2 = st.columns(2)
-    with col1:
+    c1, c2 = st.columns(2)
+    with c1:
         if st.button("✅ Approve", use_container_width=True):
-            with st.spinner("Executing..."):
-                for event in agent_graph.stream(None, config):
-                    pass # Resumes execution using None
-                
-            tool_results = agent_graph.get_state(config).values.get("tool_results", [])
-            for res in tool_results:
-                if res.get("status") == "success":
-                    st.success(f"**{res.get('intent')}**: {res.get('message')}")
-                else:
-                    st.error(f"**{res.get('intent')}**: {res.get('message')}")
-            
-    with col2:
-        if st.button("❌ Reject", use_container_width=True):
-            # To cancel, we simply wipe out the pending intents from the state
-            agent_graph.update_state(config, {"parsed_intents": []})
-            st.error("Actions rejected.")
+            results = execute_plan(st.session_state.pending_plan)
+            turns.append(
+                {
+                    "user": st.session_state.pending_user_text,
+                    "assistant": _assistant_text(results),
+                    "transcribed_text": st.session_state.last_transcription,
+                    "plan": st.session_state.pending_plan,
+                    "results": results,
+                }
+            )
+            st.session_state.pending_plan = None
+            st.session_state.pending_user_text = ""
+            st.session_state.last_transcription = ""
             st.rerun()
 
-# 3. Audio Input Zone (Only show if not currently waiting for approval)
-if not current_state.next:
-    st.write("---")
-    
-    col_mic, col_file = st.columns(2)
-    with col_mic:
-        audio_mic = st.audio_input("Record a command")
-    with col_file:
-        audio_file = st.file_uploader("Upload an audio file", type=["wav", "mp3", "m4a"])
-        
-    audio_value = audio_mic or audio_file
-    if audio_value:
-        process_audio(audio_value)
+    with c2:
+        if st.button("❌ Reject", use_container_width=True):
+            turns.append(
+                {
+                    "user": st.session_state.pending_user_text,
+                    "assistant": "Execution rejected.",
+                    "transcribed_text": st.session_state.last_transcription,
+                    "plan": st.session_state.pending_plan,
+                    "results": [],
+                }
+            )
+            st.session_state.pending_plan = None
+            st.session_state.pending_user_text = ""
+            st.session_state.last_transcription = ""
+            st.rerun()
+
+# Input
+if st.session_state.pending_plan is None:
+    col1, col2 = st.columns(2)
+    with col1:
+        mic = st.audio_input("Record")
+    with col2:
+        upl = st.file_uploader("Upload", type=["wav", "mp3", "m4a"])
+    typed = st.chat_input("Or type a command...")
+
+    user_text = typed
+    audio_blob = mic or upl
+    if audio_blob is not None:
+        with st.spinner("Transcribing..."):
+            tmp = save_audio_to_temp(audio_blob)
+            user_text = stt_engine.transcribe(tmp)
+            tmp.unlink(missing_ok=True)
+
+    if user_text and user_text.strip():
+        user_text = user_text.strip()
+        st.session_state.last_transcription = user_text
+
+        history = _history_messages(turns)
+        plan = parse_user_input(user_text, history)
+
+        if _requires_hitl(plan):
+            # single HITL for full tool intent
+            st.session_state.pending_user_text = user_text
+            st.session_state.pending_plan = plan
+        else:
+            # auto-run low-risk intents without HITL
+            results = execute_plan(plan)
+            turns.append(
+                {
+                    "user": user_text,
+                    "assistant": _assistant_text(results),
+                    "transcribed_text": user_text,
+                    "plan": plan,
+                    "results": results,
+                }
+            )
+
+        st.rerun()
