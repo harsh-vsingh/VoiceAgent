@@ -9,8 +9,8 @@ def write_code(filename: str, prompt: str) -> str:
     try:
         # Add temperature=0.0 for strict determinism
         llm = ChatOllama(
-            model=settings.GENERATION_LLM, 
-            base_url=settings.OLLAMA_BASE_URL,
+        model=settings.CODE_LLM,
+        base_url=settings.OLLAMA_BASE_URL,
             temperature=0.0
         )
         

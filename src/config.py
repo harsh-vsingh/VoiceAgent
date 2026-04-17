@@ -16,6 +16,8 @@ class AppConfig(BaseSettings):
     # Split models
     ROUTER_LLM: str = "qwen2.5:7b-instruct-q4_K_M"
     GENERATION_LLM: str = "qwen2.5:7b-instruct-q4_K_M"
+    CODE_LLM: str = "qwen2.5-coder:7b"              # (NEW: used for code gen)
+
 
     # Optional backward compatibility (if some files still use DEFAULT_LLM)
     DEFAULT_LLM: str = "qwen2.5:7b-instruct-q4_K_M"

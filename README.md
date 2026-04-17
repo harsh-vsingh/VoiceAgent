@@ -106,6 +106,7 @@ pip install -r requirements.txt
 ```bash
 ollama pull qwen2.5:7b-instruct-q4_K_M
 ollama pull llama3.1:8b
+ollama pull qwen2.5-coder:7b
 python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='openai/whisper-base')"
 ```
 
@@ -146,3 +147,19 @@ streamlit run app.py
 - **Path Traversal Blocked:** Protects against `../` or absolute escapes. 
 - **Sandboxed Operations:** All read/write restricted strictly to `output/`.
 - **Root Protection:** Sandbox root deletion is explicitly protected.
+
+## 8) Performance Benchmarks
+
+Speed tests were run locally to ensure a responsive user experience. The metrics below represent cold/warm inference times on local hardware.
+
+**Speech-to-Text (Whisper) Latency:**
+- `openai/whisper-tiny`: **~0.2 seconds**
+- `openai/whisper-small`: **~0.6 seconds**
+
+**LLM Intent Routing Latency (Structured JSON Generation):**
+Measured on a complex prompt: *"Write code for a binary search in python and save it to search.py"*
+- `llama3.1:8b`: **~4.8 seconds**
+- `qwen2.5:7b-instruct` (Hybrid Setup): **~5.4 seconds**
+- `llama3.2:3b`: **~5.8 seconds**
+
+> **Design Choice:** While `llama3.1:8b` parsed the intent slightly faster in benchmarks, **`qwen2.5-instruct`** is used as the default Router LLM due to its better reliability in generating valid, hallucination-free JSON schemas.

@@ -30,6 +30,8 @@ def _dir_tree_lines(root: Path, prefix: str = "") -> list[str]:
             lines.extend(_dir_tree_lines(p, prefix + ext))
     return lines
 
+if "processed_file_hash" not in st.session_state:
+    st.session_state.processed_file_hash = None
 
 NO_HITL_INTENTS = {
     "general_chat",
@@ -178,11 +180,19 @@ if st.session_state.pending_plan is None:
 
     user_text = typed
     audio_blob = mic or upl
+
     if audio_blob is not None:
-        with st.spinner("Transcribing..."):
-            tmp = save_audio_to_temp(audio_blob)
-            user_text = stt_engine.transcribe(tmp)
-            tmp.unlink(missing_ok=True)
+        # Check if we already processed this exact audio file
+        file_hash = hash(audio_blob.getvalue())
+        if file_hash != st.session_state.processed_file_hash:
+            with st.spinner("Transcribing..."):
+                tmp = save_audio_to_temp(audio_blob)
+                user_text = stt_engine.transcribe(tmp)
+                tmp.unlink(missing_ok=True)
+                
+            # Mark as processed
+            st.session_state.processed_file_hash = file_hash
+        # Note: No 'else: user_text = None' here. We want to preserve 'typed' if audio is stale.
 
     if user_text and user_text.strip():
         user_text = user_text.strip()
@@ -192,11 +202,9 @@ if st.session_state.pending_plan is None:
         plan = parse_user_input(user_text, history)
 
         if _requires_hitl(plan):
-            # single HITL for full tool intent
             st.session_state.pending_user_text = user_text
             st.session_state.pending_plan = plan
         else:
-            # auto-run low-risk intents without HITL
             results = execute_plan(plan)
             turns.append(
                 {
